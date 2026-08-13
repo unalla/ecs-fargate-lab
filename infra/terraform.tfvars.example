@@ -1,0 +1,8 @@
+# Copy to terraform.tfvars and edit.
+
+github_repo  = "your-github-username/ecs-fargate-lab"
+region       = "us-east-1"
+
+# Lock the ALB to your own IP while you are learning. Find it with:
+#   curl -s https://checkip.amazonaws.com
+# allowed_cidr = "203.0.113.42/32"

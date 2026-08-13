@@ -1,0 +1,10 @@
+.git
+.github
+infra
+tests
+scripts
+**/__pycache__
+*.pyc
+.pytest_cache
+README.md
+Makefile

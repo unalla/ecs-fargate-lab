@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Serving manifest</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700&family=IBM+Plex+Mono:wght@400;600&family=Inter:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  :root{
+    --paper:#E9EDF1;
+    --ink:#101E28;
+    --muted:#5C6B78;
+    --rule:#BFCAD4;
+    --signal:#0B6E4F;
+    --hazard:#A8480B;
+    --stamp:#101E28;
+  }
+  *{box-sizing:border-box}
+  body{
+    margin:0; padding:2.5rem 1.25rem 4rem;
+    background:var(--paper); color:var(--ink);
+    font-family:"Inter",system-ui,sans-serif;
+    display:flex; justify-content:center;
+  }
+  .manifest{width:100%; max-width:44rem}
+
+  .eyebrow{
+    display:flex; justify-content:space-between; align-items:baseline;
+    gap:1rem; flex-wrap:wrap;
+    font-family:"IBM Plex Mono",monospace; font-size:.7rem;
+    letter-spacing:.14em; text-transform:uppercase; color:var(--muted);
+    border-bottom:2px solid var(--ink); padding-bottom:.6rem;
+  }
+  .status{display:inline-flex; align-items:center; gap:.45rem; font-weight:600}
+  .status.ok{color:var(--signal)}
+  .status.bad{color:var(--hazard)}
+  .dot{width:.5rem; height:.5rem; border-radius:50%; background:currentColor}
+  .status.ok .dot{animation:pulse 2.4s ease-in-out infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+
+  h1{
+    font-family:"Archivo",sans-serif; font-weight:700;
+    font-size:clamp(1.5rem,4.5vw,2.1rem); line-height:1.1;
+    margin:1.6rem 0 .4rem; letter-spacing:-.02em;
+  }
+  .lede{color:var(--muted); font-size:.9rem; margin:0 0 2rem; max-width:34rem}
+
+  /* Signature element: the serving digest, stamped like a serial number. */
+  .stamp{
+    border:2px solid var(--stamp); background:transparent;
+    padding:1.1rem 1.2rem; margin-bottom:1.75rem;
+  }
+  .stamp-label{
+    font-family:"IBM Plex Mono",monospace; font-size:.66rem;
+    letter-spacing:.16em; text-transform:uppercase; color:var(--muted);
+    margin-bottom:.55rem;
+  }
+  .digest{
+    font-family:"IBM Plex Mono",monospace; font-weight:600;
+    font-size:clamp(.85rem,3.1vw,1.15rem);
+    line-height:1.5; word-break:break-all; letter-spacing:.02em;
+  }
+
+  dl{margin:0; border-top:1px solid var(--rule)}
+  .row{
+    display:grid; grid-template-columns:11rem 1fr; gap:1rem;
+    padding:.7rem 0; border-bottom:1px solid var(--rule); align-items:baseline;
+  }
+  dt{
+    font-family:"IBM Plex Mono",monospace; font-size:.68rem;
+    letter-spacing:.13em; text-transform:uppercase; color:var(--muted);
+  }
+  dd{margin:0; font-family:"IBM Plex Mono",monospace; font-size:.85rem; word-break:break-all}
+
+  .actions{margin-top:2rem; display:flex; gap:.75rem; flex-wrap:wrap; align-items:center}
+  button{
+    font-family:"Archivo",sans-serif; font-weight:500; font-size:.82rem;
+    background:transparent; color:var(--hazard);
+    border:1.5px solid var(--hazard); padding:.6rem 1rem; cursor:pointer;
+  }
+  button:hover{background:var(--hazard); color:var(--paper)}
+  button:focus-visible{outline:3px solid var(--ink); outline-offset:2px}
+  .hint{font-size:.78rem; color:var(--muted); max-width:24rem}
+
+  @media (max-width:34rem){ .row{grid-template-columns:1fr; gap:.15rem} }
+  @media (prefers-reduced-motion:reduce){ *{animation:none !important} }
+</style>
+</head>
+<body>
+<main class="manifest">
+
+  <div class="eyebrow">
+    <span>Serving manifest</span>
+    {% if healthy %}
+      <span class="status ok"><span class="dot"></span>Passing health checks</span>
+    {% else %}
+      <span class="status bad"><span class="dot"></span>Failing health checks</span>
+    {% endif %}
+  </div>
+
+  <h1>This task is running image {{ app_version }}</h1>
+  <p class="lede">Reload during a deployment and watch the digest and task hostname change as the ALB shifts traffic to the new revision.</p>
+
+  <div class="stamp">
+    <div class="stamp-label">Image digest — what is actually serving you</div>
+    <div class="digest">{{ image_digest }}</div>
+  </div>
+
+  <dl>
+    <div class="row"><dt>Base image</dt><dd>{{ base_digest }}</dd></div>
+    <div class="row"><dt>Source commit</dt><dd>{{ git_sha }}</dd></div>
+    <div class="row"><dt>Task hostname</dt><dd>{{ hostname }}</dd></div>
+    <div class="row"><dt>Started</dt><dd>{{ started_at }}</dd></div>
+    <div class="row"><dt>Uptime</dt><dd>{{ uptime_seconds }}s</dd></div>
+  </dl>
+
+  <div class="actions">
+    <button onclick="fail()">Break this task's health check</button>
+    <span class="hint">Use this to watch ECS drain the task and replace it. During a deploy, it triggers the circuit breaker and rolls back.</span>
+  </div>
+
+</main>
+<script>
+  async function fail(){
+    await fetch('/simulate-failure', {method:'POST'});
+    location.reload();
+  }
+</script>
+</body>
+</html>

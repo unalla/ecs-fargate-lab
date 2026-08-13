@@ -1,0 +1,250 @@
+name: build and deploy
+
+on:
+  push:
+    branches: [main]
+  # A base-image bump arrives as a PR. It runs the identical test and scan
+  # gates as a feature change, and deploys nothing until it is merged.
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  id-token: write # OIDC — for both AWS STS and keyless Cosign signing
+  pull-requests: write
+
+env:
+  IS_DEPLOY: ${{ github.event_name != 'pull_request' }}
+
+jobs:
+  test:
+    name: unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          pip install -r app/requirements.txt
+          pip install pytest
+
+      - name: Run test suite
+        run: pytest tests/test_app.py -v
+
+  build:
+    name: build, scan and sign
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      image_uri: ${{ steps.identity.outputs.image_uri }}
+      image_digest: ${{ steps.identity.outputs.image_digest }}
+      base_digest: ${{ steps.base.outputs.digest }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Resolve pinned base image
+        id: base
+        run: |
+          source base-image.lock
+          if [ "$BASE_IMAGE_DIGEST" = "sha256:REPLACE_ME_ON_FIRST_RUN" ]; then
+            echo "::warning::base-image.lock not seeded — resolving the live digest for this run"
+            BASE_IMAGE_DIGEST=$(docker buildx imagetools inspect "$BASE_IMAGE_TAG" \
+              --format '{{.Manifest.Digest}}')
+          fi
+          BASE_REF="${BASE_IMAGE_TAG%%:*}@${BASE_IMAGE_DIGEST}"
+          echo "digest=${BASE_IMAGE_DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
+          echo "Building FROM ${BASE_REF}"
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        if: env.IS_DEPLOY == 'true'
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Log in to Amazon ECR
+        if: env.IS_DEPLOY == 'true'
+        id: ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      # ---- pull request: build locally, never push ----
+      - name: Build image (PR — not pushed)
+        if: env.IS_DEPLOY != 'true'
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          push: false
+          tags: candidate:${{ github.sha }}
+          build-args: |
+            BASE_IMAGE=${{ steps.base.outputs.ref }}
+            BASE_DIGEST=${{ steps.base.outputs.digest }}
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=pr-${{ github.event.pull_request.number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image (PR)
+        if: env.IS_DEPLOY != 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: candidate:${{ github.sha }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      # ---- main: build, push, scan, sign ----
+      - name: Build and push image
+        if: env.IS_DEPLOY == 'true'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: ${{ vars.ECR_REPOSITORY }}:${{ github.sha }}
+          provenance: true
+          sbom: true
+          build-args: |
+            BASE_IMAGE=${{ steps.base.outputs.ref }}
+            BASE_DIGEST=${{ steps.base.outputs.digest }}
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ github.run_number }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Record image identity
+        id: identity
+        if: env.IS_DEPLOY == 'true'
+        run: |
+          DIGEST="${{ steps.push.outputs.digest }}"
+          echo "image_digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+          echo "image_uri=${{ vars.ECR_REPOSITORY }}@${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Scan pushed image
+        if: env.IS_DEPLOY == 'true'
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ vars.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}
+          severity: CRITICAL,HIGH
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Install Cosign
+        if: env.IS_DEPLOY == 'true'
+        uses: sigstore/cosign-installer@v3
+
+      # Keyless signing: the signature is bound to this workflow's OIDC
+      # identity and logged in the public Rekor transparency log. There is no
+      # private key to store, rotate, or leak.
+      - name: Sign image
+        if: env.IS_DEPLOY == 'true'
+        run: |
+          cosign sign --yes \
+            "${{ vars.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}"
+
+      - name: Attest that the scan passed
+        if: env.IS_DEPLOY == 'true'
+        run: |
+          cat > scan.json <<EOF
+          { "scanner": "trivy", "result": "pass",
+            "severities_blocked": "CRITICAL,HIGH",
+            "base_digest": "${{ steps.base.outputs.digest }}",
+            "commit": "${{ github.sha }}" }
+          EOF
+          cosign attest --yes --type custom --predicate scan.json \
+            "${{ vars.ECR_REPOSITORY }}@${{ steps.push.outputs.digest }}"
+
+  deploy:
+    name: deploy to ECS
+    needs: build
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Install Cosign
+        uses: sigstore/cosign-installer@v3
+
+      # The admission gate. In EKS this is Kyverno or an OPA policy enforcing
+      # it cluster-side; on ECS there is no admission controller, so the
+      # pipeline enforces it. An unsigned image never reaches the service.
+      - name: Verify signature before deploying
+        run: |
+          cosign verify \
+            --certificate-identity-regexp \
+              "^https://github.com/${{ github.repository }}/.github/workflows/.+@refs/heads/main$" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "${{ vars.ECR_REPOSITORY }}@${{ needs.build.outputs.image_digest }}"
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition "${{ vars.ECS_TASK_FAMILY }}" \
+            --query taskDefinition > task-definition.json
+
+      # Deploy by digest, never by tag. A tag is a label someone can move;
+      # a digest is the bytes.
+      - name: Render new task definition
+        id: render
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-definition.json
+          container-name: app
+          image: ${{ vars.ECR_REPOSITORY }}@${{ needs.build.outputs.image_digest }}
+          environment-variables: |
+            GIT_SHA=${{ github.sha }}
+            APP_VERSION=${{ github.run_number }}
+            IMAGE_DIGEST=${{ needs.build.outputs.image_digest }}
+            BASE_DIGEST=${{ needs.build.outputs.base_digest }}
+
+      # wait-for-service-stability is what makes the circuit breaker useful:
+      # if the new revision fails health checks, ECS rolls back and this step
+      # fails the workflow rather than reporting a green deploy.
+      - name: Deploy
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v2
+        with:
+          task-definition: ${{ steps.render.outputs.task-definition }}
+          service: ${{ vars.ECS_SERVICE }}
+          cluster: ${{ vars.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Smoke test the live service
+        run: |
+          python tests/smoke_test.py \
+            "${{ vars.APP_URL }}" \
+            "${{ needs.build.outputs.image_digest }}"
+
+      - name: Summary
+        run: |
+          {
+            echo "### Deployed"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| image digest | \`${{ needs.build.outputs.image_digest }}\` |"
+            echo "| base digest | \`${{ needs.build.outputs.base_digest }}\` |"
+            echo "| commit | \`${{ github.sha }}\` |"
+            echo "| url | ${{ vars.APP_URL }} |"
+          } >> "$GITHUB_STEP_SUMMARY"

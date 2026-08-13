@@ -1,0 +1,75 @@
+name: base image refresh
+
+# This is the workflow that replaces OS patching.
+#
+# Upstream publishes a new base image when a CVE is fixed. This job notices
+# the digest moved and opens a pull request changing exactly one line. That PR
+# runs the app team's own test suite before anything reaches AWS — which is
+# the whole answer to "what if the new image isn't compatible?"
+
+on:
+  schedule:
+    - cron: "0 6 * * 1" # Mondays, 06:00 UTC
+  workflow_dispatch:
+  # A CVE feed or scanner webhook can fire this immediately:
+  #   gh api repos/OWNER/REPO/dispatches -f event_type=base-image-cve
+  repository_dispatch:
+    types: [base-image-cve]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compare pinned digest against upstream
+        id: check
+        run: |
+          source base-image.lock
+          UPSTREAM=$(docker buildx imagetools inspect "$BASE_IMAGE_TAG" \
+            --format '{{.Manifest.Digest}}')
+
+          echo "pinned:   $BASE_IMAGE_DIGEST"
+          echo "upstream: $UPSTREAM"
+
+          if [ "$UPSTREAM" = "$BASE_IMAGE_DIGEST" ]; then
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+            echo "Base image is current. Nothing to do."
+          else
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+            echo "new_digest=$UPSTREAM" >> "$GITHUB_OUTPUT"
+            echo "old_digest=$BASE_IMAGE_DIGEST" >> "$GITHUB_OUTPUT"
+            sed -i "s|^BASE_IMAGE_DIGEST=.*|BASE_IMAGE_DIGEST=${UPSTREAM}|" base-image.lock
+          fi
+
+      - name: Open pull request
+        if: steps.check.outputs.changed == 'true'
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/base-image-refresh
+          commit-message: "chore: refresh base image digest"
+          title: "Base image refresh"
+          labels: security, automated
+          body: |
+            Upstream published a new build of the pinned base image.
+
+            | | |
+            |---|---|
+            | was | `${{ steps.check.outputs.old_digest }}` |
+            | now | `${{ steps.check.outputs.new_digest }}` |
+
+            **Nothing has been deployed.** Merging this PR is what ships it.
+
+            The build pipeline runs on this PR and will:
+            1. run the full unit test suite against the new OS layer
+            2. rebuild the image — only the base layer changes, dependency and
+               application layers come from cache
+            3. fail on any new CRITICAL or HIGH vulnerability with a fix available
+
+            If CI is green, the change is safe to merge. If CI is red, the new
+            base broke something and production is still running the old image,
+            untouched.
